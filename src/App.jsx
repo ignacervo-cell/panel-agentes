@@ -1,7 +1,39 @@
 import { useState, useRef, useEffect } from "react";
 
-const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
-const WEB_SEARCH_TOOL = [{ type: "web_search_20250305", name: "web_search" }];
+const CHAT_API = "/api/chat";
+const EUREKA_API = "/api/eureka";
+const MODEL = "claude-sonnet-5-5";
+
+const WEB_SEARCH_TOOL = { type: "web_search_20260209", name: "web_search" };
+
+const EUREKA_TOOLS = [
+  {
+    name: "eureka_buscar",
+    description: "Busca fallos en Eureka, la base de jurisprudencia pública del Poder Judicial del Chubut (vista anónima: fallos anonimizados). Devuelve hasta 20 resultados por página con id, número/año de sentencia, organismo, competencia, tipo, fecha de firma y link al PDF. La búsqueda es por texto completo de la sentencia; los nombres de las partes y lugares suelen estar anonimizados, así que buscá por tema (ej. 'desalojo', 'alimentos') más que por nombres.",
+    input_schema: {
+      type: "object",
+      properties: {
+        texto: { type: "string", description: "Palabras a buscar en el texto de los fallos" },
+        anio: { type: "string", description: "Año de la sentencia (ej. '2026'). Vacío para todos los años" },
+        pagina: { type: "integer", description: "Página de resultados, empieza en 1" },
+      },
+      required: ["texto"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "eureka_leer",
+    description: "Descarga una sentencia de Eureka por su id (el que devuelve eureka_buscar) y devuelve la ficha (organismo, expediente, fecha de firma, firmantes), el texto completo extraído del PDF y el link al PDF original.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", description: "id de la sentencia en Eureka" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+];
 
 const SYSTEM_JUDICIAL = `Eres un experto en comunicación judicial argentina con acceso a búsqueda web. Podés buscar información, leer URLs y acceder a contenido online cuando sea necesario.
 
@@ -22,7 +54,10 @@ Cuando el usuario te comparta contenido o URL, generás el Doble Producto:
 RESTRICCIONES:
 - Prohibido inventar datos que no estén en el texto o en la búsqueda.
 - Sin consejos ni párrafos preventivos.
-- Localidad: mencioná la ciudad al inicio de la nota.`;
+- Localidad: mencioná la ciudad al inicio de la nota.
+
+EUREKA:
+Tenés acceso a Eureka (jurisprudencia del Poder Judicial del Chubut) con las herramientas eureka_buscar y eureka_leer. Cuando te pidan un fallo, buscalo ahí y leelo completo antes de redactar. Trabajá solo con lo que dice la sentencia e incluí siempre el link al PDF original de Eureka para que se pueda verificar. Si no encontrás el fallo, decilo y contá qué búsquedas hiciste.`;
 
 const SYSTEM_LIBRE = `Sos Claude, un asistente de IA creado por Anthropic. Tenés acceso a búsqueda web: podés leer URLs, buscar información actual, analizar páginas y responder cualquier consulta con datos reales. Cuando el usuario comparte una URL o pide información de un sitio, usá la herramienta de búsqueda para acceder al contenido. Respondé siempre en español. Sé directo y preciso.`;
 
@@ -35,6 +70,7 @@ const AGENTS = [
     tag: "COMUNICACIÓN JUDICIAL",
     placeholder: "Pegá texto, URL de resolución o expediente...",
     system: SYSTEM_JUDICIAL,
+    tools: [WEB_SEARCH_TOOL, ...EUREKA_TOOLS],
   },
   {
     id: "libre",
@@ -44,6 +80,7 @@ const AGENTS = [
     tag: "ASISTENTE GENERAL",
     placeholder: "Escribí lo que necesitás o pegá una URL...",
     system: SYSTEM_LIBRE,
+    tools: [WEB_SEARCH_TOOL],
   },
 ];
 
@@ -96,6 +133,23 @@ function Bubble({ msg, accent }) {
   );
 }
 
+async function runTool(block) {
+  const accion = { eureka_buscar: "buscar", eureka_leer: "leer" }[block.name];
+  if (!accion) {
+    return { type: "tool_result", tool_use_id: block.id, content: `Herramienta desconocida: ${block.name}`, is_error: true };
+  }
+  try {
+    const params = new URLSearchParams({ accion });
+    for (const [k, v] of Object.entries(block.input)) params.set(k, String(v));
+    const res = await fetch(`${EUREKA_API}?${params}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `Error ${res.status}`);
+    return { type: "tool_result", tool_use_id: block.id, content: JSON.stringify(data) };
+  } catch (error) {
+    return { type: "tool_result", tool_use_id: block.id, content: `Error consultando Eureka: ${error.message}`, is_error: true };
+  }
+}
+
 export default function App() {
   const [activeId, setActiveId] = useState("judicial");
   const [histories, setHistories] = useState({ judicial: [], libre: [] });
@@ -126,50 +180,47 @@ export default function App() {
       let convo = [...newHistory];
 
       while (true) {
-        const res = await fetch(ANTHROPIC_API, {
+        const res = await fetch(CHAT_API, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 1000,
+            model: MODEL,
+            max_tokens: 16000,
             system: agent.system,
-            tools: WEB_SEARCH_TOOL,
+            tools: agent.tools,
+            fallbacks: "default",
             messages: convo,
           }),
         });
 
         const data = await res.json();
-        if (!data.content) throw new Error("Sin respuesta");
+        if (!data.content) throw new Error(data.error?.message || "Sin respuesta");
 
         convo = [...convo, { role: "assistant", content: data.content }];
 
-        if (data.stop_reason === "end_turn") {
-          const reply = getTextFromContent(data.content);
-          setHistories(h => ({
-            ...h,
-            [activeId]: [...newHistory, { role: "assistant", content: reply }],
-          }));
-          break;
+        // La búsqueda web corre del lado de Anthropic; si se pausa, se retoma igual.
+        if (data.stop_reason === "pause_turn") {
+          setStatus("🔍 Buscando en la web...");
+          continue;
         }
 
         if (data.stop_reason === "tool_use") {
-          setStatus("🔍 Buscando en la web...");
           const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
-          const toolResults = toolUseBlocks.map(block => ({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: "Búsqueda completada.",
-          }));
+          setStatus(toolUseBlocks.some(b => b.name === "eureka_leer")
+            ? "📄 Leyendo sentencia en Eureka..."
+            : "📚 Buscando en Eureka...");
+          const toolResults = await Promise.all(toolUseBlocks.map(runTool));
           convo = [...convo, { role: "user", content: toolResults }];
           continue;
         }
 
-        // Fallback
-        const fallback = getTextFromContent(data.content);
-        if (fallback) {
+        const reply = data.stop_reason === "refusal"
+          ? "No puedo ayudar con esa consulta."
+          : getTextFromContent(data.content);
+        if (reply) {
           setHistories(h => ({
             ...h,
-            [activeId]: [...newHistory, { role: "assistant", content: fallback }],
+            [activeId]: [...newHistory, { role: "assistant", content: reply }],
           }));
         }
         break;
@@ -265,7 +316,7 @@ export default function App() {
             <span style={{ fontSize: 18 }}>{agent.icon}</span>
             <div>
               <div style={{ fontWeight: 700, fontSize: 13, color: agent.accent }}>{agent.label}</div>
-              <div style={{ fontSize: 10, color: "#bbb", letterSpacing: 1 }}>{agent.tag} · 🌐 Web Search</div>
+              <div style={{ fontSize: 10, color: "#bbb", letterSpacing: 1 }}>{agent.tag} · 🌐 Web Search{agent.tools.some(t => t.name === "eureka_buscar") && " · 📚 Eureka"}</div>
             </div>
           </div>
           <button
